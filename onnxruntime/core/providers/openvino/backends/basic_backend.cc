@@ -166,7 +166,7 @@ bool BasicBackend::ValidateSubgraph(std::map<std::string, std::shared_ptr<ov::No
   return false;
 }
 
-void BasicBackend::PopulateConfigValue(ov::AnyMap& device_config) {
+void BasicBackend::SetOVDeviceConfiguration(ov::AnyMap& device_config) {
   device_config = {};
   // Set inference precision based on device precision for OV backend
   if (session_context_.precision.find("FP16") != std::string::npos &&
@@ -211,6 +211,42 @@ void BasicBackend::PopulateConfigValue(ov::AnyMap& device_config) {
 #endif
   }
 
+  // cache_dir argument has no effect when working with an embed-mode EPContext Graph
+  if (!subgraph_context_.is_ep_ctx_graph && !session_context_.cache_dir.empty() && !session_context_.so_context_enable) {
+    LOGS_DEFAULT(INFO) << log_tag << "Enables Caching";
+    device_config.emplace(ov::cache_dir(session_context_.cache_dir.string()));
+  }
+
+  if (session_context_.enable_opencl_throttling == true &&
+      session_context_.device_type.find("GPU") != std::string::npos) {
+    LOGS_DEFAULT(INFO) << log_tag << "Enabled OpenCL queue throttling for GPU device";
+    std::pair<std::string, ov::Any> device_property;
+    device_property = std::make_pair("PLUGIN_THROTTLE", "1");
+    device_config.emplace(ov::device::properties("GPU_CONFIG_KEY", device_property));
+  }
+
+  // Return silently for NPU as it's currently treated as a read-only flag by the NPU plugin
+  // and throws an exception for the same
+  if (session_context_.device_type.find("NPU") != std::string::npos) {
+  }
+  // Streams can be set only if the device is not one of AUTO, MULTI, or HETERO
+  // Throw an exception if the user tries to set num_streams for these devices
+  else if ((session_context_.device_type.find("MULTI") != std::string::npos) ||
+           (session_context_.device_type.find("HETERO") != std::string::npos) ||
+           (session_context_.device_type.find("AUTO") != std::string::npos)) {
+    if (session_context_.num_streams != 1) {
+      ORT_THROW(log_tag + "Cannot set NUM_STREAMS to " +
+                std::to_string(session_context_.num_streams) + " for device " + session_context_.device_type);
+    }
+    // Do nothing
+  } else {
+    device_config.emplace(ov::num_streams(session_context_.num_streams));
+  }
+
+  // inference_num_threads is applicable only for the CPU device
+  if (session_context_.device_type.find("CPU") != std::string::npos)
+    device_config.emplace(ov::inference_num_threads(session_context_.num_of_threads));
+
   if (!session_context_.load_config.empty()) {
     const std::map<std::string, ov::AnyMap>& target_config = session_context_.load_config;
 
@@ -240,69 +276,6 @@ void BasicBackend::PopulateConfigValue(ov::AnyMap& device_config) {
       }
     }
   }
-}
-
-void BasicBackend::EnableCaching(ov::AnyMap& device_config) {
-  // cache_dir argument has no effect when working with an embed-mode EPContext Graph
-  if (subgraph_context_.is_ep_ctx_graph) return;
-
-  if (!session_context_.cache_dir.empty() && !session_context_.so_context_enable) {
-    LOGS_DEFAULT(INFO) << log_tag << "Enables Caching";
-    device_config.emplace(ov::cache_dir(session_context_.cache_dir.string()));
-  }
-}
-
-void BasicBackend::EnableGPUThrottling(ov::AnyMap& device_config) {
-  if (session_context_.enable_opencl_throttling == true &&
-      session_context_.device_type.find("GPU") != std::string::npos) {
-    LOGS_DEFAULT(INFO) << log_tag << "Enabled OpenCL queue throttling for GPU device";
-    std::pair<std::string, ov::Any> device_property;
-    device_property = std::make_pair("PLUGIN_THROTTLE", "1");
-    device_config.emplace(ov::device::properties("GPU_CONFIG_KEY", device_property));
-  }
-}
-
-void BasicBackend::EnableStreams(ov::AnyMap& device_config) {
-  // Return silently for NPU as it's currently treated as a read-only flag by the NPU plugin
-  // and throws an exception for the same
-  if (session_context_.device_type.find("NPU") != std::string::npos)
-    return;
-
-  // Streams can be set only if the device is not one of AUTO, MULTI, or HETERO
-  // Throw an exception if the user tries to set num_streams for these devices
-  if ((session_context_.device_type.find("MULTI") != std::string::npos) ||
-      (session_context_.device_type.find("HETERO") != std::string::npos) ||
-      (session_context_.device_type.find("AUTO") != std::string::npos)) {
-    if (session_context_.num_streams != 1) {
-      ORT_THROW(log_tag + "Cannot set NUM_STREAMS to " +
-                std::to_string(session_context_.num_streams) + " for device " + session_context_.device_type);
-    }
-    // Do nothing
-  } else {
-    device_config.emplace(ov::num_streams(session_context_.num_streams));
-  }
-}
-
-void BasicBackend::SetNumThreads(ov::AnyMap& device_config) {
-  // inference_num_threads is applicable only for the CPU device
-  if (session_context_.device_type.find("CPU") != std::string::npos)
-    device_config.emplace(ov::inference_num_threads(session_context_.num_of_threads));
-}
-
-void BasicBackend::SetOVDeviceConfiguration(ov::AnyMap& device_config) {
-  PopulateConfigValue(device_config);
-
-  // Enable caching
-  EnableCaching(device_config);
-
-  // Setting OpenCL queue throttling for GPU
-  EnableGPUThrottling(device_config);
-
-  // Enable streams; default=1 unless overridden by user configuration
-  EnableStreams(device_config);
-
-  // Set the inference_num_threads property of the CPU
-  SetNumThreads(device_config);
 
   auto npuw_status =
       std::any_of(device_config.begin(), device_config.end(), [&](const std::pair<std::string, ov::Any>& pair) {
